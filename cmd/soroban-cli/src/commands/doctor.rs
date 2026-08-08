@@ -194,6 +194,19 @@ fn version_cache_writer() -> Option<CheckWriter> {
 /// upgrade leaves an older version recorded against the very path now running,
 /// and that is one install, not two -- treating it as a mismatch would warn
 /// about every upgrade until the cache was next written.
+///
+/// The version then decides how loudly a difference in path is reported, not
+/// whether there is one. An executable that recorded this very version has
+/// nothing to mislead anyone with, whichever install it belongs to, so it is
+/// reported rather than warned about. The warning is kept for the case that
+/// actually confuses people: a different path *and* a different version.
+///
+/// Folding paths together instead -- reading `stellar` and `soroban` beside
+/// each other as one install, since one install does ship both -- would silence
+/// that case exactly where it is most common. A `soroban` left behind by
+/// `cargo install soroban-cli` sits in the same `~/.cargo/bin` as the `stellar`
+/// that replaced it, at a version years apart; siblings are the shape of the
+/// confusion in #2464, not proof of a shared origin.
 fn show_version_cache_writer(print: &Print, writer: Option<&CheckWriter>) {
     let Some(writer) = writer else {
         // Either no cache yet or one written before the CLI recorded this, so
@@ -219,6 +232,21 @@ fn show_version_cache_writer(print: &Print, writer: Option<&CheckWriter>) {
                      it is now {running}"
                 ));
             }
+        }
+        // A different file, but not a different answer: it recorded the version
+        // this CLI would have recorded itself, so nothing taken from the cache
+        // can disagree with `stellar --version`. One install ships both
+        // `stellar` and `soroban`, so this is the ordinary state for anyone who
+        // still invokes the old name -- and two installs that happen to sit at
+        // one version have nothing to tell apart either.
+        (Some(_), Some(running))
+            if writer.version.is_some() && writer.version == this_cli.version =>
+        {
+            print.infoln(format!(
+                "Version cache was last checked by a different Stellar CLI at the same version: \
+                 {writer}"
+            ));
+            print.blankln(format!("this one is {running}"));
         }
         (Some(_), Some(_)) => {
             print.warnln(format!(

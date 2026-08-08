@@ -81,6 +81,15 @@ fn running_binary() -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// A path beside the running executable, where the crate's other binary name
+/// lands when one install ships both.
+fn sibling_binary(name: &str) -> String {
+    PathBuf::from(running_binary())
+        .with_file_name(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Seed the shared version cache with a given writer, and return the data home
 /// that holds it.
 ///
@@ -357,6 +366,57 @@ fn warns_when_a_different_install_wrote_the_cache() {
              22.8.0 (/opt/elsewhere/bin/soroban)",
         ))
         .stderr(contains(format!("this one is {} (", pkg())));
+}
+
+#[test]
+fn does_not_warn_when_the_other_binary_name_wrote_the_cache_at_this_version() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "bin");
+    // One install ships both `stellar` and `soroban`, so the old name beside
+    // this one is the ordinary state for anyone who still invokes it. It
+    // recorded the version this CLI would have recorded itself, so there is
+    // nothing here to disagree with `stellar --version`.
+    let sibling = sibling_binary("soroban");
+    let data_home = seed_cache_writer(
+        &sandbox,
+        serde_json::json!({ "version": pkg(), "executable": sibling }),
+    );
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains(format!(
+            "Version cache was last checked by a different Stellar CLI at the same version: \
+             {} ({sibling})",
+            pkg()
+        )))
+        // The warning keeps its colon straight after "CLI", so this misses the
+        // line above and catches only the warning itself.
+        .stderr(contains("a different Stellar CLI:").not());
+}
+
+#[test]
+fn warns_when_the_other_binary_name_wrote_the_cache_at_another_version() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "bin");
+    // Sitting beside this executable is not proof of a shared install: a
+    // `soroban` left behind by `cargo install soroban-cli` shares `~/.cargo/bin`
+    // with the `stellar` that replaced it, years apart in version. That is the
+    // confusion #2464 is about, so folding the two names into one identity
+    // would silence this report exactly where it is needed.
+    let sibling = sibling_binary("soroban");
+    let data_home = seed_cache_writer(
+        &sandbox,
+        serde_json::json!({ "version": "22.8.0", "executable": sibling }),
+    );
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains(format!(
+            "Version cache was last checked by a different Stellar CLI: 22.8.0 ({sibling})"
+        )))
+        .stderr(contains("at the same version").not());
 }
 
 #[test]
