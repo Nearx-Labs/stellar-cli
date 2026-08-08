@@ -53,21 +53,28 @@ fn write_unrunnable_cli(dir: &Path, name: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A directory under the sandbox, in the same canonicalized form `doctor`
-/// reports paths in.
+/// A directory under the sandbox, canonicalized so that the `PATH` these tests
+/// set and the paths they expect back are one spelling of it.
 ///
-/// `find_installs` canonicalizes every executable it discovers, so an expected
-/// path built from an uncanonicalized sandbox never matches: on macOS the
+/// `doctor` echoes the `PATH` entry it found an executable under, so any
+/// consistent spelling would do -- but only if it is consistent. On macOS the
 /// temporary directory sits under `/var/folders`, a symlink to `/private/var`,
-/// and the two spellings compare unequal as strings.
+/// and mixing the two forms compares them unequal as strings.
 fn empty_dir(sandbox: &TestEnv, name: &str) -> PathBuf {
     let dir = sandbox.dir().join(name);
     fs::create_dir_all(&dir).unwrap();
     dir.canonicalize().unwrap_or(dir)
 }
 
-/// The path `doctor` sees as its own executable, in the canonicalized form it
-/// compares cache entries against.
+/// The path `doctor` reports as its own executable, and compares cache entries
+/// against.
+///
+/// `running_binary` leaves `current_exe` as the process was started from, and
+/// the two platforms hand that over differently: Linux resolves it through
+/// `/proc/self/exe` before the CLI sees it, macOS gives the invoked path.
+/// Canonicalizing here matches Linux exactly, and matches macOS as long as no
+/// symlink stands in the cargo target path -- which is what makes the two forms
+/// the same string.
 fn running_binary() -> String {
     let path = assert_cmd::cargo::cargo_bin("stellar");
     let path = path.canonicalize().unwrap_or(path);

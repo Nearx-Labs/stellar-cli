@@ -376,8 +376,16 @@ fn summarize_versions(installs: &[(PathBuf, Option<String>)]) -> InstalledVersio
 
 /// Every distinct Stellar CLI executable reachable by name on `PATH`, with the
 /// version it reports.
+///
+/// Reported as `PATH` offers them, canonicalized only to recognize one file
+/// reached two ways. A package manager that installs through a symlink -- as
+/// Homebrew does -- has a canonical path carrying the version it currently
+/// points at, so reporting that form names a path the user never typed and
+/// cannot act on, and it disagrees with the running executable line above it
+/// for what is one install.
 fn find_installs() -> Vec<(PathBuf, Option<String>)> {
     let mut installs: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
 
     for name in CLI_BINARY_NAMES {
         let Ok(paths) = which::which_all(name) else {
@@ -388,12 +396,13 @@ fn find_installs() -> Vec<(PathBuf, Option<String>)> {
             // `which_all` yields one entry per matching `PATH` element, so the
             // same binary shows up repeatedly when `PATH` has duplicates.
             let key = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if installs.iter().any(|(seen, _)| *seen == key) {
+            if seen.contains(&key) {
                 continue;
             }
+            seen.push(key);
 
             let version = installed_version(&path);
-            installs.push((key, version));
+            installs.push((path, version));
         }
     }
 

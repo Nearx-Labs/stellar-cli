@@ -21,13 +21,17 @@ const FILE_NAME: &str = "upgrade_check.json";
 /// installation identity: an in-place upgrade changes the version at one path
 /// without becoming a second install, so only the path can answer "was this a
 /// different CLI?". The version is diagnostic detail carried alongside it.
+///
+/// For the same reason the executable is stored as the process was started
+/// from, unresolved: a symlink-managed upgrade retargets the file a path points
+/// at, and the path is the install that outlives it.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Default)]
 pub struct CheckWriter {
     /// The version of the CLI that wrote the file, if it recorded one.
     #[serde(default)]
     pub version: Option<String>,
-    /// The canonicalized path of the executable that wrote the file, if it
-    /// could be resolved.
+    /// The path of the executable that wrote the file, if it could be
+    /// resolved.
     #[serde(default)]
     pub executable: Option<String>,
 }

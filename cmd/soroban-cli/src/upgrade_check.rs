@@ -41,11 +41,24 @@ struct Crate {
 /// thinks they are running. Naming the executable makes the warning say which
 /// install it is actually about.
 ///
-/// Canonicalized, so that the value written to the shared cache and the value
-/// compared against it later describe the same path in the same form.
+/// Left as the process was started from, not canonicalized. Resolving symlinks
+/// would read a normal in-place upgrade as a second install wherever a package
+/// manager installs through one: Homebrew keeps `/opt/homebrew/bin/stellar`
+/// pointing into a versioned Cellar directory and retargets it on upgrade, so
+/// the canonical path changes while the install does not -- and `doctor` would
+/// then report a different CLI on every upgrade. The path the user invokes
+/// outlives the file it happens to point at, which is what makes it identity.
+///
+/// It is also the more useful thing to name in a warning: it is the path the
+/// user can act on, rather than one they never typed.
+///
+/// This only reaches as far as the platform allows. Linux resolves
+/// `current_exe` through `/proc/self/exe` before we see it, so a retargeted
+/// symlink still reads as a new install there; nothing in-process can recover
+/// the invoked path once the kernel has resolved it. Not canonicalizing keeps
+/// the platforms that do hand us the invoked path from losing it too.
 pub fn running_binary() -> Option<String> {
     let path = std::env::current_exe().ok()?;
-    let path = path.canonicalize().unwrap_or(path);
 
     Some(path.to_string_lossy().into_owned())
 }
