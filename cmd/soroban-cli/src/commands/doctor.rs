@@ -239,14 +239,12 @@ fn show_version_cache_writer(print: &Print, writer: Option<&CheckWriter>) {
         // `stellar` and `soroban`, so this is the ordinary state for anyone who
         // still invokes the old name -- and two installs that happen to sit at
         // one version have nothing to tell apart either.
-        (Some(_), Some(running))
-            if writer.version.is_some() && writer.version == this_cli.version =>
-        {
+        (Some(_), Some(_)) if writer.version.is_some() && writer.version == this_cli.version => {
             print.infoln(format!(
                 "Version cache was last checked by a different Stellar CLI at the same version: \
                  {writer}"
             ));
-            print.blankln(format!("this one is {running}"));
+            print.blankln(format!("this one is {this_cli}"));
         }
         (Some(_), Some(_)) => {
             print.warnln(format!(

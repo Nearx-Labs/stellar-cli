@@ -390,6 +390,10 @@ fn does_not_warn_when_the_other_binary_name_wrote_the_cache_at_this_version() {
              {} ({sibling})",
             pkg()
         )))
+        // Names this CLI, version included: the shared version is the reason
+        // this is not a warning, so losing it here would drop the fact that
+        // makes the line true.
+        .stderr(contains(format!("this one is {} (", pkg())))
         // The warning keeps its colon straight after "CLI", so this misses the
         // line above and catches only the warning itself.
         .stderr(contains("a different Stellar CLI:").not());
