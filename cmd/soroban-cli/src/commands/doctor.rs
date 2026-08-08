@@ -50,7 +50,9 @@ impl Cmd {
 
         // Read this before `check_version`, which refreshes the cache and would
         // otherwise record this very run as the writer -- hiding the mismatch
-        // the report exists to reveal.
+        // the report exists to reveal. `cli::runs_its_own_upgrade_check` keeps
+        // the background check from being spawned alongside this command, so
+        // that refresh is the only writer this read has to stay ahead of.
         let previous_cache_writer = version_cache_writer();
 
         check_version(&print).await?;

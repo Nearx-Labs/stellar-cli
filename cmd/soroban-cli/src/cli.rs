@@ -78,8 +78,10 @@ pub async fn main() {
     // It depends on logger, so we need to place it after
     // the code block that initializes the logger.
     let quiet = root.global_args.quiet;
-    let upgrade_check_handle = tokio::spawn(async move {
-        upgrade_check(quiet).await;
+    let upgrade_check_handle = (!runs_its_own_upgrade_check(&root.cmd)).then(|| {
+        tokio::spawn(async move {
+            upgrade_check(quiet).await;
+        })
     });
 
     let printer = Print::new(root.global_args.quiet);
@@ -124,13 +126,30 @@ pub async fn main() {
 // than the unconditional drop it replaces.
 const UPGRADE_CHECK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn finish_upgrade_check(handle: tokio::task::JoinHandle<()>) {
+async fn finish_upgrade_check(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+
     if tokio::time::timeout(UPGRADE_CHECK_GRACE, handle)
         .await
         .is_err()
     {
         tracing::debug!("upgrade check did not finish within its grace period");
     }
+}
+
+// Commands that check for a new release themselves, so the background check
+// alongside them would be a second one.
+//
+// `doctor` is one: it reports the upgrade state as a finding, and reports which
+// CLI last wrote the shared version cache. Two checks in one process would fetch
+// crates.io twice and write that one file concurrently -- and the background one
+// could stamp this run as the writer before `doctor` reads it, hiding the very
+// mismatch the report exists to reveal. Its own check is unconditional, so
+// nothing is lost by leaving it to do the work.
+fn runs_its_own_upgrade_check(cmd: &commands::Cmd) -> bool {
+    matches!(cmd, commands::Cmd::Doctor(_))
 }
 
 // Load config.toml defaults as env vars, honoring --config-dir if present in raw args.
@@ -215,5 +234,25 @@ fn set_env_value_from_config<T: std::fmt::Display>(name: &str, value: Option<T>)
     if std::env::var(name).is_err() {
         std::env::set_var(name, value.to_string());
         std::env::set_var(format!("{name}_SOURCE"), "use");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn doctor_is_left_to_check_for_itself() {
+        let root = Root::try_parse_from(["stellar", "doctor"]).unwrap();
+
+        assert!(runs_its_own_upgrade_check(&root.cmd));
+    }
+
+    #[test]
+    fn other_commands_keep_the_background_check() {
+        let root = Root::try_parse_from(["stellar", "version"]).unwrap();
+
+        assert!(!runs_its_own_upgrade_check(&root.cmd));
     }
 }
