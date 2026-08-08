@@ -135,6 +135,30 @@ fn reports_the_running_executable_and_a_lone_install() {
 }
 
 #[test]
+fn warns_when_the_only_install_cannot_report_a_version() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "one-install-unreadable");
+    let data_home = empty_dir(&sandbox, "data-home");
+    write_unrunnable_cli(&bin_dir, "stellar");
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains(
+            "Found one Stellar CLI on PATH, but it did not report a version",
+        ))
+        // Being alone is not a clean bill of health. The line a healthy lone
+        // install gets would put a success marker above one reading "unknown
+        // version", and the same silent executable warns as soon as it has
+        // company.
+        .stderr(contains("Only one Stellar CLI found on PATH").not())
+        .stderr(contains(format!(
+            "- {} (unknown version)",
+            bin_dir.join("stellar").to_string_lossy()
+        )));
+}
+
+#[test]
 fn reports_when_no_cli_is_on_path() {
     let sandbox = TestEnv::default();
     let bin_dir = empty_dir(&sandbox, "no-installs");

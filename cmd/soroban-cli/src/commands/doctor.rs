@@ -263,7 +263,19 @@ fn check_installs(print: &Print) {
         // One file, so nothing can disagree with it. Still list it: the running
         // executable is not necessarily the one `PATH` resolves by name, and the
         // line above carries no version.
-        (1, _) => print.checkln("Only one Stellar CLI found on PATH:".to_string()),
+        (1, InstalledVersions::Agreed(_)) => {
+            print.checkln("Only one Stellar CLI found on PATH:".to_string());
+        }
+        // Nothing disagreed here either, but nothing answered: a success tick
+        // above a line reading "unknown version" contradicts itself, and the
+        // very same failed probe warns as soon as a second executable exists.
+        // A `stellar` on `PATH` that cannot say what it is deserves the same
+        // doubt whether or not it has company.
+        (1, InstalledVersions::Unanswered { .. }) => print.warnln(
+            "Found one Stellar CLI on PATH, but it did not report a version; it may be broken \
+             or not a Stellar CLI at all:"
+                .to_string(),
+        ),
         (count, InstalledVersions::Agreed(version)) => print.checkln(format!(
             "{count} Stellar CLI executables on PATH, all reporting {version}:"
         )),
@@ -313,6 +325,9 @@ enum InstalledVersions {
     /// Two executables reported different versions. This is the case that makes
     /// the upgrade warning look wrong. Carries how many could not be asked: they
     /// took no part in the disagreement, so they are not part of its count.
+    ///
+    /// Two known versions are needed to observe this, so a single executable
+    /// cannot produce it however its probe went.
     Disagree { unanswered: usize },
     /// At least one executable could not be asked for its version, and none of
     /// those that did contradict each other, so agreement is unestablished
