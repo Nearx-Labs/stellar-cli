@@ -10,7 +10,7 @@ use crate::commands::contract::Error::{Deploy, Invoke};
 use crate::commands::Error::Contract;
 use crate::config::{locator::cli_config_file, Config};
 use crate::print::Print;
-use crate::upgrade_check::upgrade_check;
+use crate::upgrade_check::{upgrade_check, FETCH_TIMEOUT};
 use crate::{commands, env_vars, Root};
 use std::error::Error;
 
@@ -124,18 +124,27 @@ pub async fn main() {
 // immediately; the wait only bites when the check actually went to the network,
 // which is at most once a day. Dropping it after the grace period is no worse
 // than the unconditional drop it replaces.
-const UPGRADE_CHECK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+//
+// Must outlast `FETCH_TIMEOUT`: the fetch itself is allowed to take that long,
+// and a grace period shorter than it would give up before a slow-but-successful
+// check could write its result to the cache -- reintroducing the very bug this
+// exists to fix.
+const UPGRADE_CHECK_GRACE: std::time::Duration =
+    FETCH_TIMEOUT.saturating_add(std::time::Duration::from_secs(1));
 
 async fn finish_upgrade_check(handle: Option<tokio::task::JoinHandle<()>>) {
     let Some(handle) = handle else {
         return;
     };
 
-    if tokio::time::timeout(UPGRADE_CHECK_GRACE, handle)
-        .await
-        .is_err()
-    {
-        tracing::debug!("upgrade check did not finish within its grace period");
+    match tokio::time::timeout(UPGRADE_CHECK_GRACE, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_err)) => {
+            tracing::debug!("upgrade check task failed: {join_err}");
+        }
+        Err(_) => {
+            tracing::debug!("upgrade check did not finish within its grace period");
+        }
     }
 }
 

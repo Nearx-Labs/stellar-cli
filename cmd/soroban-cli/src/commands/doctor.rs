@@ -56,7 +56,7 @@ impl Cmd {
         let previous_cache_writer = version_cache_writer();
 
         check_version(&print).await?;
-        check_installs(&print);
+        check_installs(&print).await;
         show_version_cache_writer(&print, previous_cache_writer.as_ref());
         check_rust_version(&print);
         check_wasm_target(&print);
@@ -275,13 +275,13 @@ const CLI_BINARY_NAMES: [&str; 2] = ["stellar", "soroban"];
 /// `soroban`, so a single healthy install puts two files on `PATH` -- warning
 /// about that would flag nearly every install. Warn when the versions actually
 /// disagree.
-fn check_installs(print: &Print) {
+async fn check_installs(print: &Print) {
     match running_binary() {
         Some(binary) => print.infoln(format!("Running executable: {binary}")),
         None => print.warnln("Could not determine the running executable".to_string()),
     }
 
-    let installs = find_installs();
+    let installs = find_installs().await;
 
     match (installs.len(), summarize_versions(&installs)) {
         (0, _) => print.warnln(
@@ -411,7 +411,7 @@ fn summarize_versions(installs: &[(PathBuf, Option<String>)]) -> InstalledVersio
 /// points at, so reporting that form names a path the user never typed and
 /// cannot act on, and it disagrees with the running executable line above it
 /// for what is one install.
-fn find_installs() -> Vec<(PathBuf, Option<String>)> {
+async fn find_installs() -> Vec<(PathBuf, Option<String>)> {
     let mut installs: Vec<(PathBuf, Option<String>)> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
 
@@ -429,7 +429,7 @@ fn find_installs() -> Vec<(PathBuf, Option<String>)> {
             }
             seen.push(key);
 
-            let version = installed_version(&path);
+            let version = installed_version(&path).await;
             installs.push((path, version));
         }
     }
@@ -446,17 +446,35 @@ fn list_installs(print: &Print, installs: &[(PathBuf, Option<String>)]) {
 
 /// Ask a CLI executable for its version. Returns `None` if it cannot be run or
 /// does not answer like a Stellar CLI.
-fn installed_version(path: &Path) -> Option<String> {
+async fn installed_version(path: &Path) -> Option<String> {
     // `--only-version` predates neither every release nor every binary name:
     // releases old enough to cause the version confusion this check exists to
     // surface reject the flag, so fall back to parsing the full version banner.
-    run_version(path, &["version", "--only-version"])
+    if let Some(version) = run_version(path, &["version", "--only-version"])
+        .await
         .and_then(|output| parse_only_version(&output))
-        .or_else(|| run_version(path, &["--version"]).and_then(|o| parse_version_banner(&o)))
+    {
+        return Some(version);
+    }
+
+    run_version(path, &["--version"])
+        .await
+        .and_then(|output| parse_version_banner(&output))
 }
 
-fn run_version(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new(path).args(args).output().ok()?;
+// `doctor` exists to diagnose a broken install, so a broken one on `PATH` must
+// not be able to hang it: something answering to `stellar`/`soroban` could be
+// an unrelated, stalled, or misbehaving executable.
+const INSTALL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn run_version(path: &Path, args: &[&str]) -> Option<String> {
+    let output = tokio::time::timeout(
+        INSTALL_PROBE_TIMEOUT,
+        tokio::process::Command::new(path).args(args).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())

@@ -13,7 +13,7 @@ const MINIMUM_CHECK_INTERVAL: Duration = Duration::from_hours(24);
 // that accepts the connection and then stalls would leave the request hanging
 // indefinitely. Bound the whole request: this is a background nicety, and it
 // must not be able to outlive the command it is running alongside.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CRATES_IO_API_URL: &str = "https://crates.io/api/v1/crates/";
 const NO_UPDATE_CHECK_ENV_VAR: &str = "STELLAR_NO_UPDATE_CHECK";
 
