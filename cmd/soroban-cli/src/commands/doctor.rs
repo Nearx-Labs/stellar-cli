@@ -468,13 +468,16 @@ async fn installed_version(path: &Path) -> Option<String> {
 const INSTALL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn run_version(path: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::time::timeout(
-        INSTALL_PROBE_TIMEOUT,
-        tokio::process::Command::new(path).args(args).output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    // Tokio does not kill a child on drop by default. Without this, a probe
+    // that times out below leaves its process running -- leaking it across
+    // repeated `doctor` runs against the same stalled executable.
+    let mut command = tokio::process::Command::new(path);
+    command.args(args).kill_on_drop(true);
+
+    let output = tokio::time::timeout(INSTALL_PROBE_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
 
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())

@@ -53,6 +53,32 @@ fn write_unrunnable_cli(dir: &Path, name: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A CLI on `PATH` that never answers -- it outlives `doctor`'s probe timeout,
+/// so the probe must time out rather than the process exiting on its own.
+///
+/// Appends its PID to `pid_file` with `>>` before looping, because
+/// `installed_version` may spawn this script twice -- once for
+/// `version --only-version`, once for `--version` -- and each spawn is a
+/// fresh process whose PID the test needs to check afterward.
+///
+/// Loops on the shell's own `:` builtin rather than shelling out to `sleep`:
+/// `doctor` sets `PATH` to exactly the directory under test (see `doctor`
+/// below), so this script inherits that same narrowed `PATH` and could not
+/// resolve an external `sleep` binary either -- it would exit almost
+/// immediately instead of hanging.
+fn write_hanging_cli(dir: &Path, name: &str, pid_file: &Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$$\" >> \"{}\"\n\
+         while :; do :; done\n",
+        pid_file.to_string_lossy()
+    );
+
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A directory under the sandbox, canonicalized so that the `PATH` these tests
 /// set and the paths they expect back are one spelling of it.
 ///
@@ -437,4 +463,70 @@ fn reports_an_unknown_cache_writer_without_claiming_a_mismatch() {
             "Version cache was last checked by an unknown Stellar CLI",
         ))
         .stderr(contains("a different Stellar CLI").not());
+}
+
+/// Tokio's `Command` does not kill a child on drop by default. `doctor` probes
+/// each executable on `PATH` under a timeout, and dropping a timed-out probe's
+/// `output()` future without `kill_on_drop(true)` would leave that child
+/// running for the rest of its natural life -- here, forever, since the fake
+/// CLI loops indefinitely -- rather than being killed when the probe gives up
+/// on it. This test fails against that unfixed behavior: the hanging script's
+/// PID would still be alive long after `doctor` exits.
+#[test]
+fn does_not_leave_an_orphaned_process_when_a_probe_times_out() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "hanging-install");
+    let data_home = empty_dir(&sandbox, "data-home");
+    let pid_file = sandbox.dir().join("hanging-install.pids");
+    write_hanging_cli(&bin_dir, "stellar", &pid_file);
+
+    doctor(&sandbox, &bin_dir, &data_home).assert().success();
+
+    let pids: Vec<u32> = fs::read_to_string(&pid_file)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse().unwrap())
+        .collect();
+    assert!(!pids.is_empty());
+
+    for pid in pids {
+        assert!(
+            !process_is_alive(pid),
+            "process {pid} is still running after doctor exited"
+        );
+    }
+}
+
+/// Whether `pid` still refers to a live process, checked with `kill -0`
+/// rather than anything Tokio-specific so this holds regardless of how the
+/// probe was implemented.
+///
+/// Polls briefly instead of checking once: the child is killed on drop, but
+/// getting reaped by Tokio's orphan queue happens asynchronously, so a single
+/// check right after `doctor` exits could race the reap and see a zombie that
+/// is gone a moment later.
+fn process_is_alive(pid: u32) -> bool {
+    for attempt in 0..20 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            // A dead pid is the expected outcome here, so let `kill` report it
+            // through its exit status alone -- its complaint on stderr is
+            // localized, and would land in the test output as noise.
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        if !status.success() {
+            return false;
+        }
+    }
+
+    // Still answering to `kill -0` after ~1s of polling: not a reap race,
+    // actually still running.
+    true
 }
