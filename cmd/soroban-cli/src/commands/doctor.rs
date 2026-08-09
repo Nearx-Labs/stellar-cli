@@ -474,6 +474,13 @@ async fn run_version(path: &Path, args: &[&str]) -> Option<String> {
     let mut command = tokio::process::Command::new(path);
     command.args(args).kill_on_drop(true);
 
+    // Nor does Tokio's `output()` close stdin, where `std`'s does: it pipes
+    // stdout and stderr and leaves stdin alone, so the child inherits the
+    // terminal. A probe is not a conversation -- anything on `PATH` answering
+    // to `stellar`/`soroban` gets run here, and one that reads stdin would eat
+    // input meant for the shell. Hand it EOF instead.
+    command.stdin(std::process::Stdio::null());
+
     let output = tokio::time::timeout(INSTALL_PROBE_TIMEOUT, command.output())
         .await
         .ok()?

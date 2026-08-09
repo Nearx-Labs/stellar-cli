@@ -45,6 +45,32 @@ fn write_fake_cli(dir: &Path, name: &str, version: &str, supports_only_version: 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A CLI on `PATH` that answers version queries and reports, to `stdin_log`,
+/// whether it was handed readable input or EOF.
+///
+/// Records `read:<line>` when a read succeeds and `eof` when it does not, so a
+/// probe that inherited the caller's stdin is distinguishable from one given
+/// `/dev/null` by what it wrote, not by how long it took.
+fn write_stdin_reading_cli(dir: &Path, name: &str, version: &str, stdin_log: &Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         if IFS= read -r line; then\n\
+           echo \"read:$line\" >> \"{log}\"\n\
+         else\n\
+           echo \"eof\" >> \"{log}\"\n\
+         fi\n\
+         case \"$*\" in\n\
+           \"version --only-version\") echo \"{version}\" ;;\n\
+           *) echo \"unexpected args: $*\" >&2; exit 1 ;;\n\
+         esac\n",
+        log = stdin_log.to_string_lossy()
+    );
+
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A CLI on `PATH` that cannot be asked for its version -- an install too
 /// broken to answer either version query.
 fn write_unrunnable_cli(dir: &Path, name: &str) {
@@ -463,6 +489,36 @@ fn reports_an_unknown_cache_writer_without_claiming_a_mismatch() {
             "Version cache was last checked by an unknown Stellar CLI",
         ))
         .stderr(contains("a different Stellar CLI").not());
+}
+
+/// Tokio's `output()` pipes stdout and stderr but leaves stdin untouched, so a
+/// probe inherits whatever the shell handed `doctor` -- `std`'s `output()`,
+/// which this probe used before it moved onto Tokio, closes it instead. Any
+/// executable on `PATH` named `stellar`/`soroban` is run here, so one that
+/// reads stdin would swallow input meant for the shell.
+///
+/// Deterministic rather than timed: the fake CLI writes what it saw, so the
+/// unfixed behavior shows up as `read:<the sentinel>` rather than as a probe
+/// that merely took longer.
+#[test]
+fn does_not_hand_a_probe_the_callers_stdin() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "stdin-reading-install");
+    let data_home = empty_dir(&sandbox, "data-home");
+    let stdin_log = sandbox.dir().join("stdin-reading-install.log");
+    write_stdin_reading_cli(&bin_dir, "stellar", "27.1.0", &stdin_log);
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .write_stdin("SENTINEL\n")
+        .assert()
+        .success();
+
+    let seen = fs::read_to_string(&stdin_log).unwrap();
+    assert!(!seen.is_empty(), "the probe never ran");
+    assert!(
+        !seen.contains("SENTINEL"),
+        "a probe read the caller's stdin: {seen}"
+    );
 }
 
 /// Tokio's `Command` does not kill a child on drop by default. `doctor` probes
