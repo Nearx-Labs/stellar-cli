@@ -490,12 +490,24 @@ fn does_not_leave_an_orphaned_process_when_a_probe_times_out() {
         .collect();
     assert!(!pids.is_empty());
 
-    for pid in pids {
-        assert!(
-            !process_is_alive(pid),
-            "process {pid} is still running after doctor exited"
-        );
+    // Read the verdict before acting on it, then clean up whatever is left
+    // regardless of what it says. Failing here means the probes leaked, and
+    // what they leaked is a shell spinning on a full core with no exit
+    // condition -- asserting first would strand one per failing run.
+    let survivors: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|pid| process_is_alive(*pid))
+        .collect();
+
+    for pid in &pids {
+        kill(*pid, "-9");
     }
+
+    assert!(
+        survivors.is_empty(),
+        "processes {survivors:?} were still running after doctor exited"
+    );
 }
 
 /// Whether `pid` still refers to a live process, checked with `kill -0`
@@ -512,16 +524,7 @@ fn process_is_alive(pid: u32) -> bool {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        let status = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            // A dead pid is the expected outcome here, so let `kill` report it
-            // through its exit status alone -- its complaint on stderr is
-            // localized, and would land in the test output as noise.
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-
-        if !status.success() {
+        if !kill(pid, "-0") {
             return false;
         }
     }
@@ -529,4 +532,19 @@ fn process_is_alive(pid: u32) -> bool {
     // Still answering to `kill -0` after ~1s of polling: not a reap race,
     // actually still running.
     true
+}
+
+/// Send `signal` to `pid`, reporting whether `kill` accepted it -- `-0` sends
+/// nothing and so answers whether the process exists at all.
+///
+/// A pid that is already gone is an expected outcome at both call sites, so
+/// `kill` reports it through its exit status alone: its complaint on stderr is
+/// localized, and would land in the test output as noise.
+fn kill(pid: u32, signal: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
