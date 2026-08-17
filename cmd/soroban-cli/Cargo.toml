@@ -134,6 +134,12 @@ rustc_version = "0.4.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
+# `doctor` puts each version probe in its own process group so a probe that
+# times out can be killed along with anything it started. Reaching a group needs
+# `kill(-pgid)`, which has no std equivalent.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 crate-git-revision = "0.0.9"
 serde.workspace = true

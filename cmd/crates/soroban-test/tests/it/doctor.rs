@@ -105,6 +105,50 @@ fn write_hanging_cli(dir: &Path, name: &str, pid_file: &Path) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A CLI on `PATH` that starts a background process of its own and then hangs.
+///
+/// `kill_on_drop` reaches the probe and nothing it started, so this is what
+/// distinguishes killing the process from killing its process group: the child
+/// keeps running after its parent dies unless the group was signalled. Records
+/// the parent's PID to `pid_file` and the child's to `child_pid_file`.
+///
+/// The child is started through an absolute `/bin/sh` because `doctor` narrows
+/// `PATH` to the directory under test, so no bare command name would resolve.
+/// The parent records `$!` itself rather than letting the child report its own
+/// PID, which would race the parent's hang.
+fn write_hanging_cli_with_child(dir: &Path, name: &str, pid_file: &Path, child_pid_file: &Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$$\" >> \"{parent}\"\n\
+         /bin/sh -c 'while :; do :; done' &\n\
+         echo \"$!\" >> \"{child}\"\n\
+         while :; do :; done\n",
+        parent = pid_file.to_string_lossy(),
+        child = child_pid_file.to_string_lossy()
+    );
+
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A CLI on `PATH` that writes to stdout without stopping.
+///
+/// Nothing it prints is a version, and it never exits on its own, so an
+/// unbounded read would buffer until memory ran out. The line is a literal
+/// rather than built with `seq`/`printf`: `doctor` narrows `PATH` to the
+/// directory under test, so no external command would resolve here.
+fn write_flooding_cli(dir: &Path, name: &str) {
+    let line = "x".repeat(1024);
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nwhile :; do echo \"{line}\"; done\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A directory under the sandbox, canonicalized so that the `PATH` these tests
 /// set and the paths they expect back are one spelling of it.
 ///
@@ -584,6 +628,200 @@ fn does_not_hand_a_probe_the_callers_stdin() {
     );
 }
 
+/// `kill_on_drop` signals the probe and nothing the probe started. A wrapper
+/// script on `PATH` -- a shim, a version manager, anything that execs something
+/// else in the background -- outlives the probe through its children unless the
+/// whole process group is killed, which is why the probe is given a group of its
+/// own. Without that, the child here keeps spinning after `doctor` exits.
+#[test]
+fn kills_what_a_timed_out_probe_started_too() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "hanging-install-with-child");
+    let data_home = empty_dir(&sandbox, "data-home");
+    let pid_file = sandbox.dir().join("parent.pids");
+    let child_pid_file = sandbox.dir().join("child.pids");
+    write_hanging_cli_with_child(&bin_dir, "stellar", &pid_file, &child_pid_file);
+
+    doctor(&sandbox, &bin_dir, &data_home).assert().success();
+
+    let children: Vec<u32> = fs::read_to_string(&child_pid_file)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert!(!children.is_empty(), "the fake CLI started no child");
+
+    let survivors = survivors_of(&children);
+
+    kill_all_in(&pid_file);
+    kill_all_in(&child_pid_file);
+
+    assert!(
+        survivors.is_empty(),
+        "a timed-out probe's children {survivors:?} outlived it"
+    );
+}
+/// Each hung executable costs a full probe timeout, so probing in series makes
+/// the wait grow with the number of executables on `PATH` -- which is exactly
+/// what the per-probe timeout exists to prevent, defeated by arithmetic. With
+/// eight hung executables, serial probing cannot finish inside this bound and
+/// concurrent probing cannot exceed it: one timeout plus `doctor`'s own work.
+#[test]
+fn probes_installs_concurrently_so_hung_ones_do_not_accumulate() {
+    let sandbox = TestEnv::default();
+    let data_home = empty_dir(&sandbox, "data-home");
+    let pid_file = sandbox.dir().join("many-hanging.pids");
+
+    // Two binary names per directory, so four directories put eight hung
+    // executables on `PATH`.
+    let dirs: Vec<PathBuf> = (0..4)
+        .map(|i| {
+            let dir = empty_dir(&sandbox, &format!("many-hanging-{i}"));
+            write_hanging_cli(&dir, "stellar", &pid_file);
+            write_hanging_cli(&dir, "soroban", &pid_file);
+            dir
+        })
+        .collect();
+
+    let path = dirs
+        .iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    let started = std::time::Instant::now();
+    let assert = doctor(&sandbox, &path, &data_home).assert().success();
+    let elapsed = started.elapsed();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    kill_all_in(&pid_file);
+
+    assert!(
+        stderr.contains("8 executables on PATH did not answer within 2s"),
+        "expected all eight to be probed and reported hung: {stderr}"
+    );
+    // Serial probing spends 8 x 2s here. The bound leaves generous room for
+    // `doctor`'s crates.io fetch, which has a 5s timeout of its own.
+    assert!(
+        elapsed < std::time::Duration::from_secs(14),
+        "probing eight hung executables took {elapsed:?}, which is serial, not concurrent"
+    );
+}
+/// An empty or relative `PATH` entry resolves against the working directory, so
+/// a file named `stellar` in whatever directory the user happens to be in would
+/// be executed by a probe. `doctor` runs every match it finds and must not be
+/// reachable that way; the marker file is what a run would leave behind.
+#[test]
+fn does_not_probe_an_executable_reached_through_a_relative_path_entry() {
+    let sandbox = TestEnv::default();
+    let cwd = empty_dir(&sandbox, "working-directory");
+    let relative_bin = empty_dir(&sandbox, "working-directory/relative-bin");
+    let data_home = empty_dir(&sandbox, "data-home");
+    let marker = sandbox.dir().join("relative-probe-ran");
+
+    for dir in [&cwd, &relative_bin] {
+        let path = dir.join("stellar");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho ran >> \"{}\"\necho \"22.8.0\"\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // An empty entry and a relative one, which is every way `PATH` can name the
+    // working directory.
+    let mut cmd = doctor(&sandbox, ":relative-bin", &data_home);
+    cmd.current_dir(&cwd).assert().success();
+
+    assert!(
+        !marker.exists(),
+        "a probe ran an executable found through a relative PATH entry"
+    );
+}
+/// An executable that writes without stopping and never exits would be buffered
+/// in full by an unbounded read. The probe caps what it will hold and treats
+/// reaching the cap as the answer -- nothing that long is a version banner -- so
+/// this finishes promptly and reports the executable as unreadable rather than
+/// growing until memory runs out.
+#[test]
+fn does_not_buffer_unbounded_output_from_a_probe() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "flooding-install");
+    let data_home = empty_dir(&sandbox, "data-home");
+    write_flooding_cli(&bin_dir, "stellar");
+
+    let started = std::time::Instant::now();
+    let assert = doctor(&sandbox, &bin_dir, &data_home).assert().success();
+    let elapsed = started.elapsed();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    assert!(
+        stderr.contains(&format!(
+            "- {} (unknown version)",
+            bin_dir.join("stellar").to_string_lossy()
+        )),
+        "a flooding executable should be reported as unreadable, not hung: {stderr}"
+    );
+    // The cap is reached in well under a millisecond of the child's output, so
+    // neither probe should reach its timeout. Two timeouts would be 4s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "reading a flooding executable took {elapsed:?}; the cap did not cut it short"
+    );
+}
+/// A hung executable and an unreadable one are both "did not answer", but only
+/// the first is itself the fault -- and only the first explains why `doctor` took
+/// as long as it did. Issue #2676 asked for that distinction to be decided
+/// rather than left implicit; this is the decision, asserted.
+#[test]
+fn distinguishes_a_hung_executable_from_one_that_cannot_answer() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "hung-and-unreadable");
+    let data_home = empty_dir(&sandbox, "data-home");
+    let pid_file = sandbox.dir().join("hung-and-unreadable.pids");
+    write_hanging_cli(&bin_dir, "stellar", &pid_file);
+    write_unrunnable_cli(&bin_dir, "soroban");
+
+    let assert = doctor(&sandbox, &bin_dir, &data_home).assert().success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    // Clean up before asserting: a failing assertion must not be what stops
+    // the cleanup from running.
+    for pid in fs::read_to_string(&pid_file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.parse::<u32>().ok())
+    {
+        kill(pid, "-9");
+    }
+
+    assert!(
+        stderr.contains("did not answer within 2s and had to be killed"),
+        "the hung executable was not called out: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "- {} (hung; killed after timing out)",
+            bin_dir.join("stellar").to_string_lossy()
+        )),
+        "the hung executable was not labelled distinctly: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "- {} (unknown version)",
+            bin_dir.join("soroban").to_string_lossy()
+        )),
+        "the unrunnable executable should keep the unknown-version label: {stderr}"
+    );
+}
+
 /// Tokio's `Command` does not kill a child on drop by default. `doctor` probes
 /// each executable on `PATH` under a timeout, and dropping a timed-out probe's
 /// `output()` future without `kill_on_drop(true)` would leave that child
@@ -629,30 +867,92 @@ fn does_not_leave_an_orphaned_process_when_a_probe_times_out() {
     );
 }
 
-/// Whether `pid` still refers to a live process, checked with `kill -0`
-/// rather than anything Tokio-specific so this holds regardless of how the
-/// probe was implemented.
+/// Whether `pid` still refers to a live process of its own.
 ///
-/// Polls briefly instead of checking once: the child is killed on drop, but
-/// getting reaped by Tokio's orphan queue happens asynchronously, so a single
-/// check right after `doctor` exits could race the reap and see a zombie that
-/// is gone a moment later.
+/// Signal 0 alone is not enough: it succeeds for a zombie, which is a process
+/// that has already died and is only waiting to be reaped. The child is killed
+/// when the timed-out probe is dropped, but reaping happens asynchronously --
+/// through Tokio's orphan queue, or through init once `doctor` exits -- so a
+/// zombie right after `doctor` returns is the expected outcome of a *correct*
+/// kill, not evidence of a leak. Polling past it is what the previous version of
+/// this check did, and it made the test tolerate a real leak for a second before
+/// noticing. Reading the state instead answers the question directly.
 fn process_is_alive(pid: u32) -> bool {
     for attempt in 0..20 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        if !kill(pid, "-0") {
+        if !kill(pid, "-0") || process_is_a_zombie(pid) {
             return false;
         }
     }
 
-    // Still answering to `kill -0` after ~1s of polling: not a reap race,
-    // actually still running.
+    // Still a live, non-zombie process after ~1s: not a reap race, actually
+    // still running.
     true
 }
 
+/// Whether `pid` has exited and is only awaiting a reap.
+///
+/// Asked through `ps` rather than `/proc`, which macOS does not have. `ps` is
+/// resolved through the environment's `PATH` like any other command, and an
+/// environment without it degrades to "not a zombie" rather than failing: the
+/// caller's liveness check is the load-bearing half, and this only refines it.
+fn process_is_a_zombie(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .starts_with('Z')
+}
+/// Kill every PID listed in `pid_file`, ignoring ones already gone.
+///
+/// Called before asserting, in every test that starts a hanging fake, so that a
+/// failing assertion is never what stops the cleanup from running.
+fn kill_all_in(pid_file: &Path) -> Vec<u32> {
+    let pids: Vec<u32> = fs::read_to_string(pid_file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    for pid in &pids {
+        kill(*pid, "-9");
+    }
+
+    pids
+}
+/// Wait briefly for every PID in `pids` to be gone, then report the survivors.
+///
+/// Polls rather than checking once: the kill is delivered as `doctor` exits, and
+/// the reap that follows it is asynchronous.
+fn survivors_of(pids: &[u32]) -> Vec<u32> {
+    for attempt in 0..20 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if pids.iter().all(|pid| !process_is_alive_once(*pid)) {
+            return Vec::new();
+        }
+    }
+
+    pids.iter()
+        .copied()
+        .filter(|pid| process_is_alive_once(*pid))
+        .collect()
+}
+/// One check, no polling: alive and not merely awaiting a reap.
+fn process_is_alive_once(pid: u32) -> bool {
+    kill(pid, "-0") && !process_is_a_zombie(pid)
+}
 /// Send `signal` to `pid`, reporting whether `kill` accepted it -- `-0` sends
 /// nothing and so answers whether the process exists at all.
 ///

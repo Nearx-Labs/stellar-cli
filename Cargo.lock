@@ -5414,6 +5414,7 @@ dependencies = [
  "itertools 0.10.5",
  "jsonrpsee-types",
  "keyring",
+ "libc",
  "mockito",
  "num-bigint",
  "open",

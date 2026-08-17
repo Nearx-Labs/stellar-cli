@@ -309,6 +309,12 @@ async fn check_installs(print: &Print) {
 
     let installs = find_installs().await;
 
+    let hung: Vec<&PathBuf> = installs
+        .iter()
+        .filter(|(_, version)| *version == InstallVersion::TimedOut)
+        .map(|(path, _)| path)
+        .collect();
+
     match (installs.len(), summarize_versions(&installs)) {
         (0, _) => print.warnln(
             "No Stellar CLI found on PATH; the running executable is not reachable by name"
@@ -368,6 +374,26 @@ async fn check_installs(print: &Print) {
     }
 
     list_installs(print, &installs);
+
+    // A hung executable is a fault in its own right, and a different one from an
+    // install that merely could not be read: it is why `doctor` took as long as
+    // it did, and it will keep costing that on every run until it is dealt with.
+    if !hung.is_empty() {
+        print.warnln(format!(
+            "{} on PATH did not answer within {}s and had to be killed. Unlike one that simply \
+             failed to report a version, a hung executable is itself the problem.",
+            count_of(hung.len(), "executable", "executables"),
+            INSTALL_PROBE_TIMEOUT.as_secs(),
+        ));
+    }
+}
+
+fn count_of(n: usize, singular: &str, plural: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {plural}")
+    }
 }
 
 /// What the discovered executables establish about which version is in play.
@@ -393,6 +419,47 @@ enum InstalledVersions {
     },
 }
 
+/// One discovered executable and what its probe established.
+type Install = (PathBuf, InstallVersion);
+
+/// What a probe established about one executable's version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallVersion {
+    /// It answered with a version.
+    Known(String),
+    /// It ran but did not answer like a Stellar CLI: it could not be spawned, it
+    /// exited non-zero, or what it printed was not a version.
+    Silent,
+    /// It did not answer within `INSTALL_PROBE_TIMEOUT` and was killed.
+    ///
+    /// Kept apart from `Silent` because only this one points at an executable
+    /// that is *itself* hung, which is the actionable half of the distinction:
+    /// it names the `PATH` entry that cost the user the wait, and says the entry
+    /// is stuck rather than merely unreadable. Both are still "did not answer"
+    /// to `summarize_versions`, which reasons about agreement and has no use for
+    /// the reason -- so the distinction is carried without being forced on it.
+    TimedOut,
+}
+
+impl InstallVersion {
+    /// The version, when one was actually read.
+    fn known(&self) -> Option<&str> {
+        match self {
+            Self::Known(version) => Some(version),
+            Self::Silent | Self::TimedOut => None,
+        }
+    }
+
+    /// How the outcome reads beside the path in the listing.
+    fn label(&self) -> &str {
+        match self {
+            Self::Known(version) => version,
+            Self::Silent => "unknown version",
+            Self::TimedOut => "hung; killed after timing out",
+        }
+    }
+}
+
 /// Classify the reported versions, keeping "they disagree" apart from "one of
 /// them could not be asked".
 ///
@@ -400,15 +467,13 @@ enum InstalledVersions {
 /// failed: it is an observed fact, and the failures only add to it. Either way
 /// the failures are counted separately, so neither outcome speaks for an
 /// executable that was never heard from.
-fn summarize_versions(installs: &[(PathBuf, Option<String>)]) -> InstalledVersions {
+fn summarize_versions(installs: &[Install]) -> InstalledVersions {
     let unanswered = installs
         .iter()
-        .filter(|(_, version)| version.is_none())
+        .filter(|(_, version)| version.known().is_none())
         .count();
 
-    let mut known = installs
-        .iter()
-        .filter_map(|(_, version)| version.as_deref());
+    let mut known = installs.iter().filter_map(|(_, version)| version.known());
     let first = known.next();
 
     if let Some(first) = first {
@@ -437,16 +502,33 @@ fn summarize_versions(installs: &[(PathBuf, Option<String>)]) -> InstalledVersio
 /// points at, so reporting that form names a path the user never typed and
 /// cannot act on, and it disagrees with the running executable line above it
 /// for what is one install.
-async fn find_installs() -> Vec<(PathBuf, Option<String>)> {
-    let mut installs: Vec<(PathBuf, Option<String>)> = Vec::new();
+///
+/// Discovery is sequential -- it is only `PATH` lookups -- but the probes run
+/// concurrently. Each costs up to two timeouts, so probing in series made the
+/// worst case grow with the number of executables found: enough stalled entries
+/// and `doctor` hangs for a minute, which is the thing its per-probe timeout
+/// exists to prevent. Concurrently, the worst case is one executable's wait no
+/// matter how many there are.
+async fn find_installs() -> Vec<Install> {
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
 
     for name in CLI_BINARY_NAMES {
-        let Ok(paths) = which::which_all(name) else {
+        let Ok(found) = which::which_all(name) else {
             continue;
         };
 
-        for path in paths {
+        for path in found {
+            // An empty or relative `PATH` entry resolves against the working
+            // directory, so a file named `stellar` sitting in whatever directory
+            // the user happens to be in would be executed by the probe below.
+            // `doctor` runs every match it finds; it should not be reachable
+            // that way.
+            if !path.is_absolute() {
+                tracing::debug!("ignoring non-absolute PATH match: {}", path.display());
+                continue;
+            }
+
             // `which_all` yields one entry per matching `PATH` element, so the
             // same binary shows up repeatedly when `PATH` has duplicates.
             let key = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -454,38 +536,62 @@ async fn find_installs() -> Vec<(PathBuf, Option<String>)> {
                 continue;
             }
             seen.push(key);
-
-            let version = installed_version(&path).await;
-            installs.push((path, version));
+            paths.push(path);
         }
     }
 
-    installs
+    let versions =
+        futures::future::join_all(paths.iter().map(|path| installed_version(path))).await;
+
+    paths.into_iter().zip(versions).collect()
 }
 
-fn list_installs(print: &Print, installs: &[(PathBuf, Option<String>)]) {
+fn list_installs(print: &Print, installs: &[Install]) {
     for (path, version) in installs {
-        let version = version.as_deref().unwrap_or("unknown version");
-        print.blankln(format!("- {} ({version})", path.to_string_lossy()));
+        print.blankln(format!(
+            "- {} ({})",
+            path.to_string_lossy(),
+            version.label()
+        ));
     }
 }
 
-/// Ask a CLI executable for its version. Returns `None` if it cannot be run or
-/// does not answer like a Stellar CLI.
-async fn installed_version(path: &Path) -> Option<String> {
+/// Ask a CLI executable for its version.
+async fn installed_version(path: &Path) -> InstallVersion {
     // `--only-version` predates neither every release nor every binary name:
     // releases old enough to cause the version confusion this check exists to
     // surface reject the flag, so fall back to parsing the full version banner.
-    if let Some(version) = run_version(path, &["version", "--only-version"])
-        .await
-        .and_then(|output| parse_only_version(&output))
-    {
-        return Some(version);
+    let only_version = run_version(path, &["version", "--only-version"]).await;
+
+    if let ProbeOutput::Answered(output) = &only_version {
+        if let Some(version) = parse_only_version(output) {
+            return InstallVersion::Known(version);
+        }
     }
 
-    run_version(path, &["--version"])
-        .await
-        .and_then(|output| parse_version_banner(&output))
+    // An executable that hung on the first query is hung, and asking it a second
+    // question only spends another timeout to learn the same thing.
+    if only_version == ProbeOutput::TimedOut {
+        return InstallVersion::TimedOut;
+    }
+
+    match run_version(path, &["--version"]).await {
+        ProbeOutput::Answered(output) => {
+            parse_version_banner(&output).map_or(InstallVersion::Silent, InstallVersion::Known)
+        }
+        ProbeOutput::TimedOut => InstallVersion::TimedOut,
+        ProbeOutput::Failed => InstallVersion::Silent,
+    }
+}
+
+/// The result of running one version query against one executable.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeOutput {
+    Answered(String),
+    /// Could not be spawned, or exited non-zero.
+    Failed,
+    /// Outlived `INSTALL_PROBE_TIMEOUT`.
+    TimedOut,
 }
 
 // `doctor` exists to diagnose a broken install, so a broken one on `PATH` must
@@ -493,31 +599,110 @@ async fn installed_version(path: &Path) -> Option<String> {
 // an unrelated, stalled, or misbehaving executable.
 const INSTALL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn run_version(path: &Path, args: &[&str]) -> Option<String> {
-    // Tokio does not kill a child on drop by default. Without this, a probe
-    // that times out below leaves its process running -- leaking it across
-    // repeated `doctor` runs against the same stalled executable.
+/// What a probe is allowed to make `doctor` hold in memory. A version banner is
+/// a few hundred bytes; a misbehaving executable can write until it is stopped,
+/// and `output()` would buffer all of it.
+///
+/// Reaching the cap is itself the answer. Nothing this long is a version banner,
+/// so the probe stops reading and stops waiting rather than holding a partial
+/// buffer against a child that may never exit -- which would otherwise turn a
+/// merely verbose executable into one reported as hung.
+const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
+
+async fn run_version(path: &Path, args: &[&str]) -> ProbeOutput {
     let mut command = tokio::process::Command::new(path);
-    command.args(args).kill_on_drop(true);
+    command
+        .args(args)
+        // Tokio does not kill a child on drop by default. Without this, a probe
+        // that times out below leaves its process running -- leaking it across
+        // repeated `doctor` runs against the same stalled executable.
+        .kill_on_drop(true)
+        // Nor does Tokio's `output()` close stdin, where `std`'s does: it pipes
+        // stdout and stderr and leaves stdin alone, so the child inherits the
+        // terminal. A probe is not a conversation -- anything on `PATH`
+        // answering to `stellar`/`soroban` gets run here, and one that reads
+        // stdin would eat input meant for the shell. Hand it EOF instead.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
 
-    // Nor does Tokio's `output()` close stdin, where `std`'s does: it pipes
-    // stdout and stderr and leaves stdin alone, so the child inherits the
-    // terminal. A probe is not a conversation -- anything on `PATH` answering
-    // to `stellar`/`soroban` gets run here, and one that reads stdin would eat
-    // input meant for the shell. Hand it EOF instead.
-    command.stdin(std::process::Stdio::null());
+    // `kill_on_drop` reaches the process and nothing it started. A probe that is
+    // a wrapper script has children of its own, and killing the script leaves
+    // them running -- so put the probe in a process group of its own, which
+    // makes the whole tree signallable by one call on the timeout path below.
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let output = tokio::time::timeout(INSTALL_PROBE_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
+    let Ok(mut child) = command.spawn() else {
+        return ProbeOutput::Failed;
+    };
 
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        None
+    let group = child.id();
+    let stdout = child.stdout.take().expect("stdout was piped");
+
+    let probe = async move {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_PROBE_OUTPUT)
+            .read_to_end(&mut output)
+            .await
+            .ok()?;
+
+        // Filling the cap means the executable is still talking, so waiting for
+        // it to exit could block until the timeout on a child that is only
+        // blocked writing into a pipe nobody is draining any more. It has
+        // already failed to answer like a Stellar CLI; say so now.
+        if output.len() as u64 >= MAX_PROBE_OUTPUT {
+            return None;
+        }
+
+        let status = child.wait().await.ok()?;
+
+        status
+            .success()
+            .then(|| String::from_utf8_lossy(&output).into_owned())
+    };
+
+    match tokio::time::timeout(INSTALL_PROBE_TIMEOUT, probe).await {
+        Ok(Some(output)) => ProbeOutput::Answered(output),
+        // The child is dropped with the future, so `kill_on_drop` has stopped
+        // it; this reaches anything it started, which matters for the capped
+        // case above just as much as for a timeout.
+        Ok(None) => {
+            kill_process_group(group);
+            ProbeOutput::Failed
+        }
+        Err(_) => {
+            // The future has been dropped by now, so `kill_on_drop` has already
+            // signalled the process itself; this reaches whatever it started.
+            kill_process_group(group);
+            ProbeOutput::TimedOut
+        }
     }
 }
+
+/// Kill the process group `pid` leads, which `process_group(0)` above made it
+/// the leader of.
+#[cfg(unix)]
+fn kill_process_group(pid: Option<u32>) {
+    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+
+    // Negating the pid addresses the group. Failure is expected and ignorable:
+    // the group is gone as soon as its last member is, which the kill on drop
+    // may already have accomplished.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+/// Nothing to do beyond the kill on drop: without process groups there is no
+/// way to reach a probe's children, and no `process_group` call was made above.
+#[cfg(not(unix))]
+fn kill_process_group(_pid: Option<u32>) {}
 
 fn parse_only_version(output: &str) -> Option<String> {
     let version = output.trim();
@@ -676,13 +861,57 @@ mod tests {
         assert_eq!(parse_version_banner("not a stellar cli\n"), None);
     }
 
-    fn installs(entries: &[(&str, Option<&str>)]) -> Vec<(PathBuf, Option<String>)> {
+    /// `None` stands for a probe that failed rather than one that timed out.
+    /// `summarize_versions` treats the two alike -- both are executables it
+    /// never heard from -- so the cases it does distinguish are all reachable
+    /// through this shorter spelling. `timed_out_counts_as_unanswered` covers
+    /// the other outcome directly.
+    fn installs(entries: &[(&str, Option<&str>)]) -> Vec<Install> {
         entries
             .iter()
-            .map(|(path, version)| (PathBuf::from(path), version.map(ToString::to_string)))
+            .map(|(path, version)| {
+                let version = version.map_or(InstallVersion::Silent, |version| {
+                    InstallVersion::Known(version.to_string())
+                });
+
+                (PathBuf::from(path), version)
+            })
             .collect()
     }
 
+    #[test]
+    fn timed_out_counts_as_unanswered_not_as_a_disagreement() {
+        // A hung executable told us nothing about its version, so it cannot be
+        // one of the versions observed to differ -- the same standing as one
+        // that failed to run, however differently it is reported to the user.
+        assert_eq!(
+            summarize_versions(&[
+                (
+                    PathBuf::from("/a/stellar"),
+                    InstallVersion::Known("27.1.0".to_string())
+                ),
+                (PathBuf::from("/b/soroban"), InstallVersion::TimedOut),
+            ]),
+            InstalledVersions::Unanswered {
+                agreed: Some("27.1.0".to_string()),
+                unanswered: 1
+            }
+        );
+    }
+    #[test]
+    fn a_probe_outcome_labels_itself_distinctly() {
+        // The user has to be able to tell a hung executable from an unreadable
+        // one in the listing; that distinction is the whole point of keeping
+        // `TimedOut` apart from `Silent`.
+        assert_eq!(
+            InstallVersion::Known("27.1.0".to_string()).label(),
+            "27.1.0"
+        );
+        assert_ne!(
+            InstallVersion::TimedOut.label(),
+            InstallVersion::Silent.label()
+        );
+    }
     #[test]
     fn agreement_needs_every_executable_to_have_answered() {
         assert_eq!(
