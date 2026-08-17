@@ -227,7 +227,7 @@ fn reports_the_running_executable_and_a_lone_install() {
     let sandbox = TestEnv::default();
     let bin_dir = empty_dir(&sandbox, "one-install");
     let data_home = empty_dir(&sandbox, "data-home");
-    write_fake_cli(&bin_dir, "stellar", "27.1.0", true);
+    write_fake_cli(&bin_dir, "stellar", pkg(), true);
 
     doctor(&sandbox, &bin_dir, &data_home)
         .assert()
@@ -240,9 +240,17 @@ fn reports_the_running_executable_and_a_lone_install() {
         // The lone install is listed with its version too: "Running executable"
         // is not necessarily the entry `PATH` resolves by name, and carries no
         // version of its own.
+        //
+        // Matched as a prefix, without the closing parenthesis: the listing may
+        // append a currency verdict, and whether it does depends on whether a
+        // latest release was known -- which depends on the network. What this
+        // test is about is the path and the version being listed at all;
+        // `marks_which_installs_on_path_are_behind_the_latest_release` owns the
+        // verdict.
         .stderr(contains(format!(
-            "- {} (27.1.0)",
-            bin_dir.join("stellar").to_string_lossy()
+            "- {} ({}",
+            bin_dir.join("stellar").to_string_lossy(),
+            pkg()
         )));
 }
 
@@ -307,7 +315,7 @@ fn warns_when_installs_report_different_versions() {
     let sandbox = TestEnv::default();
     let bin_dir = empty_dir(&sandbox, "two-installs-disagreeing");
     let data_home = empty_dir(&sandbox, "data-home");
-    write_fake_cli(&bin_dir, "stellar", "27.1.0", true);
+    write_fake_cli(&bin_dir, "stellar", pkg(), true);
     // Old enough to only answer `--version`, which is the fallback path.
     write_fake_cli(&bin_dir, "soroban", "22.8.0", false);
 
@@ -317,12 +325,16 @@ fn warns_when_installs_report_different_versions() {
         .stderr(contains(
             "Found 2 Stellar CLI executables on PATH reporting different versions",
         ))
+        // Prefix matches: an outdated entry gains a currency verdict, and
+        // whether one is known depends on the network. See the lone-install test
+        // above.
         .stderr(contains(format!(
-            "- {} (27.1.0)",
-            bin_dir.join("stellar").to_string_lossy()
+            "- {} ({}",
+            bin_dir.join("stellar").to_string_lossy(),
+            pkg()
         )))
         .stderr(contains(format!(
-            "- {} (22.8.0)",
+            "- {} (22.8.0",
             bin_dir.join("soroban").to_string_lossy()
         )));
 }
@@ -774,6 +786,114 @@ fn does_not_buffer_unbounded_output_from_a_probe() {
         elapsed < std::time::Duration::from_secs(10),
         "reading a flooding executable took {elapsed:?}; the cap did not cut it short"
     );
+}
+/// The version confusion in #2464 does not need the `PATH` set to disagree with
+/// itself: one stale `stellar` on `PATH`, beside a current binary invoked by
+/// absolute path, is an internally consistent set of one and still exactly the
+/// contradiction the user is looking at. A success tick over that is the wrong
+/// signal, so agreement is measured against the running CLI too.
+#[test]
+fn does_not_bless_a_lone_install_that_is_not_the_version_running() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "stale-lone-install");
+    let data_home = empty_dir(&sandbox, "data-home");
+    // Above every published release, so it differs from the running CLI without
+    // being outdated. That is the case this check uniquely catches -- and it is
+    // what makes the assertion deterministic: an install that were merely old
+    // would be absorbed by the "behind the latest release" line instead, and
+    // whether a latest release is known at all depends on the network.
+    write_fake_cli(&bin_dir, "stellar", "999.0.0", false);
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains(
+            "Only one Stellar CLI on PATH, and it is not the version running",
+        ))
+        .stderr(contains(format!(
+            "reports a version other than the {} now running, without being behind the latest \
+             release",
+            pkg()
+        )))
+        .stderr(contains("Only one Stellar CLI found on PATH").not());
+}
+/// The manual step #2464 is a report of: the reporter saw two version numbers,
+/// could not tell which install each belonged to or which one was current, and
+/// opened an issue. Listing the installs is half the answer; saying which of
+/// them is behind the latest release is the half that removes the comparison.
+///
+/// Deterministic with or without a network, which matters because `doctor`
+/// always attempts a crates.io fetch and falls back to the cache. The two fake
+/// versions bracket every value the latest release could take: `1.0.0` is below
+/// any published release, `999.0.0` is above any of them, and the seeded cache
+/// guarantees a fallback so an offline run still knows a latest version at all.
+/// So the verdict on each is fixed even though the yardstick is not.
+#[test]
+fn marks_which_installs_on_path_are_behind_the_latest_release() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "outdated-and-ahead");
+    let data_home = seed_cache_writer(&sandbox, serde_json::Value::Null);
+    write_fake_cli(&bin_dir, "stellar", "1.0.0", true);
+    write_fake_cli(&bin_dir, "soroban", "999.0.0", true);
+
+    let assert = doctor(&sandbox, &bin_dir, &data_home).assert().success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    let outdated = format!(
+        "- {} (1.0.0, outdated -- ",
+        bin_dir.join("stellar").display()
+    );
+    assert!(
+        stderr.contains(&outdated),
+        "the outdated install should be marked in the listing: {stderr}"
+    );
+
+    // The one ahead of every release is listed plainly. A verdict here would be
+    // invented: nothing establishes that a version above the latest is wrong.
+    let ahead = format!("- {} (999.0.0)", bin_dir.join("soroban").display());
+    assert!(
+        stderr.contains(&ahead),
+        "the install ahead of the latest release should carry no verdict: {stderr}"
+    );
+
+    // The actionable sentence, and the count that makes it actionable: one of
+    // the two, not both, and not "some".
+    assert!(
+        stderr.contains("1 executable on PATH is behind the latest release"),
+        "the count of outdated installs should be stated: {stderr}"
+    );
+
+    // The two lines divide the installs rather than both claiming the outdated
+    // one: being behind the latest release already explains why it differs from
+    // the CLI in use, so only the other is left for the running-version line.
+    assert!(
+        stderr.contains(&format!(
+            "1 executable on PATH reports a version other than the {} now running, without \
+             being behind the latest release",
+            pkg()
+        )),
+        "the running-version line should cover only what being outdated does not: {stderr}"
+    );
+}
+/// An executable that could not be asked for its version has no version to
+/// compare, so it must be listed without a currency verdict -- neither outdated
+/// nor current. The reason it went unanswered survives into the label unchanged.
+#[test]
+fn does_not_judge_the_currency_of_an_executable_that_did_not_answer() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "unreadable-currency");
+    let data_home = seed_cache_writer(&sandbox, serde_json::Value::Null);
+    write_unrunnable_cli(&bin_dir, "stellar");
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains(format!(
+            "- {} (unknown version)",
+            bin_dir.join("stellar").display()
+        )))
+        .stderr(contains("outdated").not())
+        .stderr(contains("behind the latest release").not());
 }
 /// A hung executable and an unreadable one are both "did not answer", but only
 /// the first is itself the fault -- and only the first explains why `doctor` took

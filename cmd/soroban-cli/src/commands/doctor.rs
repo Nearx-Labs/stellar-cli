@@ -59,8 +59,8 @@ impl Cmd {
         // writer both times instead of erasing it on the first run.
         let previous_cache_writer = UpgradeCheck::last_writer();
 
-        check_version(&print).await?;
-        check_installs(&print).await;
+        let latest_release = check_version(&print).await?;
+        check_installs(&print, latest_release.as_ref()).await;
         show_version_cache_writer(&print, &previous_cache_writer);
         check_rust_version(&print);
         check_wasm_target(&print);
@@ -159,20 +159,29 @@ async fn inspect_networks(print: &Print, config_locator: &locator::Args) -> Resu
     Ok(())
 }
 
-async fn check_version(print: &Print) -> Result<(), Error> {
-    if let Ok((upgrade_available, current_version, latest_version)) =
+/// Report whether this CLI is current, and return the latest release it was
+/// judged against so the installs found on `PATH` can be judged against the
+/// same one.
+///
+/// Returns `None` when no latest version is known. The empty cache holds
+/// `0.0.0`, so an offline run with nothing to fall back on would otherwise
+/// "learn" that every install on the machine is ahead of the latest release.
+async fn check_version(print: &Print) -> Result<Option<Version>, Error> {
+    let Ok((upgrade_available, current_version, latest_version)) =
         has_available_upgrade(CachePolicy::ReadOnly).await
-    {
-        if upgrade_available {
-            print.warnln(upgrade_message(&current_version, &latest_version));
-        } else {
-            print.checkln(format!(
-                "You are using the latest version of Stellar CLI: {current_version}"
-            ));
-        }
+    else {
+        return Ok(None);
+    };
+
+    if upgrade_available {
+        print.warnln(upgrade_message(&current_version, &latest_version));
+    } else {
+        print.checkln(format!(
+            "You are using the latest version of Stellar CLI: {current_version}"
+        ));
     }
 
-    Ok(())
+    Ok((latest_version > Version::new(0, 0, 0)).then_some(latest_version))
 }
 
 /// Report which CLI last checked for a new release and wrote the shared version
@@ -301,13 +310,42 @@ const CLI_BINARY_NAMES: [&str; 2] = ["stellar", "soroban"];
 /// `soroban`, so a single healthy install puts two files on `PATH` -- warning
 /// about that would flag nearly every install. Warn when the versions actually
 /// disagree.
-async fn check_installs(print: &Print) {
+async fn check_installs(print: &Print, latest: Option<&Version>) {
     match running_binary() {
         Some(binary) => print.infoln(format!("Running executable: {binary}")),
         None => print.warnln("Could not determine the running executable".to_string()),
     }
 
     let installs = find_installs().await;
+    let this_version = crate::commands::version::pkg();
+
+    // Checked against the running binary, not only between the executables
+    // found. An install on `PATH` that answers with a version this binary does
+    // not share is the whole shape of #2464 -- and the `PATH` set need not
+    // disagree with *itself* for that to happen. A lone stale `stellar` on
+    // `PATH`, next to a current binary the user invoked by absolute path, is an
+    // internally consistent set of one and still the exact confusion being
+    // diagnosed. Without this, that case earns a success tick.
+    //
+    // Reported below only for the executables that being *behind the latest
+    // release* does not already account for. In the ordinary case the two
+    // overlap completely -- a forgotten old `soroban` is both -- and saying it
+    // twice buries the one line that carries an action. What is left is the case
+    // this check uniquely catches: an install that differs from the running one
+    // without being out of date at all.
+    let stale: Vec<&PathBuf> = installs
+        .iter()
+        .filter(|(_, version)| version.known().is_some_and(|found| found != this_version))
+        .filter(|(_, version)| version.is_behind(latest) != Some(true))
+        .map(|(path, _)| path)
+        .collect();
+
+    // The success tick, though, turns on any disagreement with the running CLI,
+    // including one already explained by being outdated. An install behind the
+    // latest release is still not the CLI in use.
+    let agrees_with_this_cli = !installs
+        .iter()
+        .any(|(_, version)| version.known().is_some_and(|found| found != this_version));
 
     let hung: Vec<&PathBuf> = installs
         .iter()
@@ -315,7 +353,24 @@ async fn check_installs(print: &Print) {
         .map(|(path, _)| path)
         .collect();
 
-    match (installs.len(), summarize_versions(&installs)) {
+    summarize_installs(print, &installs, agrees_with_this_cli, this_version);
+    list_installs(print, &installs, latest);
+
+    report_install_currency(print, &installs, latest, &stale, &hung, this_version);
+}
+
+/// The one line that says what the discovered executables amount to.
+///
+/// Split out of `check_installs` because it answers one question -- what the set
+/// establishes about itself -- across a wide match, while its caller answers a
+/// different one: what the reader should do about it.
+fn summarize_installs(
+    print: &Print,
+    installs: &[Install],
+    agrees_with_this_cli: bool,
+    this_version: &str,
+) {
+    match (installs.len(), summarize_versions(installs)) {
         (0, _) => print.warnln(
             "No Stellar CLI found on PATH; the running executable is not reachable by name"
                 .to_string(),
@@ -323,9 +378,11 @@ async fn check_installs(print: &Print) {
         // One file, so nothing can disagree with it. Still list it: the running
         // executable is not necessarily the one `PATH` resolves by name, and the
         // line above carries no version.
-        (1, InstalledVersions::Agreed(_)) => {
+        (1, InstalledVersions::Agreed(_)) if agrees_with_this_cli => {
             print.checkln("Only one Stellar CLI found on PATH:".to_string());
         }
+        (1, InstalledVersions::Agreed(_)) => print
+            .warnln("Only one Stellar CLI on PATH, and it is not the version running:".to_string()),
         // Nothing disagreed here either, but nothing answered: a success tick
         // above a line reading "unknown version" contradicts itself, and the
         // very same failed probe warns as soon as a second executable exists.
@@ -336,20 +393,25 @@ async fn check_installs(print: &Print) {
              or not a Stellar CLI at all:"
                 .to_string(),
         ),
-        (count, InstalledVersions::Agreed(version)) => print.checkln(format!(
-            "{count} Stellar CLI executables on PATH, all reporting {version}:"
+        (count, InstalledVersions::Agreed(version)) if agrees_with_this_cli => print.checkln(
+            format!("{count} Stellar CLI executables on PATH, all reporting {version}:"),
+        ),
+        // Internally consistent and still not the CLI in use, so the agreement
+        // is real but not reassuring. Name the version they settled on, since
+        // that is what disagrees with the one running.
+        (count, InstalledVersions::Agreed(version)) => print.warnln(format!(
+            "{count} Stellar CLI executables on PATH, all reporting {version}, which is not the \
+             {this_version} now running:"
         )),
         (count, InstalledVersions::Disagree { unanswered: 0 }) => print.warnln(format!(
-            "Found {count} Stellar CLI executables on PATH reporting different versions; \
-             an outdated one can report a version that disagrees with `stellar --version`:"
+            "Found {count} Stellar CLI executables on PATH reporting different versions:"
         )),
         // Only the ones that answered were seen to disagree. Folding the silent
         // ones into that count would attribute an observation to executables
         // that were never heard from.
         (count, InstalledVersions::Disagree { unanswered }) => print.warnln(format!(
             "Found {count} Stellar CLI executables on PATH; the {} that reported a version do \
-             not agree ({unanswered} could not be asked); an outdated one can report a version \
-             that disagrees with `stellar --version`:",
+             not agree ({unanswered} could not be asked):",
             count - unanswered
         )),
         // Not a version disagreement -- we could not establish one either way,
@@ -372,8 +434,58 @@ async fn check_installs(print: &Print) {
              so whether they agree could not be determined:"
         )),
     }
+}
 
-    list_installs(print, &installs);
+/// What the reader should do about the executables just listed.
+///
+/// Three findings, each said only when it adds something the others did not: how
+/// many are out of date, how many merely differ from the CLI in use, and how many
+/// are hung.
+fn report_install_currency(
+    print: &Print,
+    installs: &[Install],
+    latest: Option<&Version>,
+    stale: &[&PathBuf],
+    hung: &[&PathBuf],
+    this_version: &str,
+) {
+    // The listing already marks each outdated executable; this says how many
+    // there are and what to do, which is the part the reader would otherwise
+    // have to conclude for themselves. Nothing is said when none are behind, or
+    // when no latest release is known to compare against.
+    let behind = installs
+        .iter()
+        .filter(|(_, version)| version.is_behind(latest) == Some(true))
+        .count();
+
+    if behind > 0 {
+        let latest = latest.expect("a comparison was made, so a latest version was known");
+
+        print.warnln(format!(
+            "{} on PATH {} behind the latest release ({latest}). Upgrade or remove {}: an \
+             outdated one prints upgrade warnings naming its own version, which is what makes \
+             them look wrong.",
+            count_of(behind, "executable", "executables"),
+            if behind == 1 { "is" } else { "are" },
+            if behind == 1 { "it" } else { "them" },
+        ));
+    }
+
+    // Said after the list, so the paths it refers to are on screen. The summary
+    // line above describes what the `PATH` set says among itself; this one is
+    // about the running binary, and neither substitutes for the other.
+    if !stale.is_empty() {
+        print.warnln(format!(
+            "{} on PATH {} a version other than the {this_version} now running, without being \
+             behind the latest release.",
+            count_of(stale.len(), "executable", "executables"),
+            if stale.len() == 1 {
+                "reports"
+            } else {
+                "report"
+            },
+        ));
+    }
 
     // A hung executable is a fault in its own right, and a different one from an
     // install that merely could not be read: it is why `doctor` took as long as
@@ -419,6 +531,39 @@ enum InstalledVersions {
     },
 }
 
+/// Classify the reported versions, keeping "they disagree" apart from "one of
+/// them could not be asked".
+///
+/// A disagreement between known versions is reported even when other probes
+/// failed: it is an observed fact, and the failures only add to it. Either way
+/// the failures are counted separately, so neither outcome speaks for an
+/// executable that was never heard from.
+fn summarize_versions(installs: &[Install]) -> InstalledVersions {
+    let unanswered = installs
+        .iter()
+        .filter(|(_, version)| version.known().is_none())
+        .count();
+
+    let mut known = installs.iter().filter_map(|(_, version)| version.known());
+    let first = known.next();
+
+    if let Some(first) = first {
+        if !known.all(|version| version == first) {
+            return InstalledVersions::Disagree { unanswered };
+        }
+    }
+
+    match (first, unanswered) {
+        (Some(version), 0) => InstalledVersions::Agreed(version.to_string()),
+        // Everything that answered agreed; `first` carries that version so the
+        // one fact established here is not thrown away with the failed probes.
+        _ => InstalledVersions::Unanswered {
+            agreed: first.map(ToString::to_string),
+            unanswered,
+        },
+    }
+}
+
 /// One discovered executable and what its probe established.
 type Install = (PathBuf, InstallVersion);
 
@@ -458,38 +603,39 @@ impl InstallVersion {
             Self::TimedOut => "hung; killed after timing out",
         }
     }
+
+    /// Whether this executable is behind `latest`.
+    ///
+    /// `None` when the comparison cannot be made -- no latest release is known,
+    /// the executable never answered, or what it answered does not parse as a
+    /// version. Those are three different reasons to say nothing, and none of
+    /// them is evidence that the install is current.
+    fn is_behind(&self, latest: Option<&Version>) -> Option<bool> {
+        let latest = latest?;
+        let found = Version::parse(self.known()?).ok()?;
+
+        Some(found < *latest)
+    }
 }
 
-/// Classify the reported versions, keeping "they disagree" apart from "one of
-/// them could not be asked".
+/// How one discovered executable reads in the listing.
 ///
-/// A disagreement between known versions is reported even when other probes
-/// failed: it is an observed fact, and the failures only add to it. Either way
-/// the failures are counted separately, so neither outcome speaks for an
-/// executable that was never heard from.
-fn summarize_versions(installs: &[Install]) -> InstalledVersions {
-    let unanswered = installs
-        .iter()
-        .filter(|(_, version)| version.known().is_none())
-        .count();
-
-    let mut known = installs.iter().filter_map(|(_, version)| version.known());
-    let first = known.next();
-
-    if let Some(first) = first {
-        if !known.all(|version| version == first) {
-            return InstalledVersions::Disagree { unanswered };
+/// The version alone leaves the reader to compare it against the latest release
+/// themselves, which is the manual step #2464 is a report of: the user saw two
+/// numbers, could not tell which install each belonged to or which was current,
+/// and opened an issue. Saying "outdated" next to the path is the answer they
+/// were assembling by hand.
+///
+/// Only stated when it is known. An executable that did not answer, or one
+/// checked with no latest release to compare against, is listed without a
+/// verdict rather than with a reassuring one.
+fn install_label(version: &InstallVersion, latest: Option<&Version>) -> String {
+    match version.is_behind(latest) {
+        Some(true) => {
+            let latest = latest.expect("a comparison was made, so a latest version was known");
+            format!("{}, outdated -- {latest} is available", version.label())
         }
-    }
-
-    match (first, unanswered) {
-        (Some(version), 0) => InstalledVersions::Agreed(version.to_string()),
-        // Everything that answered agreed; `first` carries that version so the
-        // one fact established here is not thrown away with the failed probes.
-        _ => InstalledVersions::Unanswered {
-            agreed: first.map(ToString::to_string),
-            unanswered,
-        },
+        Some(false) | None => version.label().to_string(),
     }
 }
 
@@ -546,12 +692,12 @@ async fn find_installs() -> Vec<Install> {
     paths.into_iter().zip(versions).collect()
 }
 
-fn list_installs(print: &Print, installs: &[Install]) {
+fn list_installs(print: &Print, installs: &[Install], latest: Option<&Version>) {
     for (path, version) in installs {
         print.blankln(format!(
             "- {} ({})",
             path.to_string_lossy(),
-            version.label()
+            install_label(version, latest)
         ));
     }
 }
@@ -898,6 +1044,64 @@ mod tests {
             }
         );
     }
+
+    fn known(version: &str) -> InstallVersion {
+        InstallVersion::Known(version.to_string())
+    }
+
+    #[test]
+    fn marks_an_install_behind_the_latest_release_as_outdated() {
+        let latest = Version::parse("27.1.0").unwrap();
+
+        assert_eq!(
+            install_label(&known("22.8.0"), Some(&latest)),
+            "22.8.0, outdated -- 27.1.0 is available"
+        );
+    }
+
+    #[test]
+    fn does_not_mark_an_install_at_or_past_the_latest_release() {
+        let latest = Version::parse("27.1.0").unwrap();
+
+        // At the latest: nothing to say beyond the version.
+        assert_eq!(install_label(&known("27.1.0"), Some(&latest)), "27.1.0");
+        // Ahead of it -- a local build, or a release newer than the cache knows.
+        // Not outdated, and not something to invent a verdict about.
+        assert_eq!(install_label(&known("28.0.0"), Some(&latest)), "28.0.0");
+    }
+
+    #[test]
+    fn says_nothing_about_currency_when_the_latest_release_is_unknown() {
+        // An offline run with no cache to fall back on. Every install here is
+        // unjudged, not current -- claiming otherwise would be the reassuring
+        // lie this whole report exists to avoid.
+        assert_eq!(install_label(&known("22.8.0"), None), "22.8.0");
+        assert_eq!(known("22.8.0").is_behind(None), None);
+    }
+
+    #[test]
+    fn says_nothing_about_currency_for_an_executable_that_did_not_answer() {
+        let latest = Version::parse("27.1.0").unwrap();
+
+        // No version to compare, so no verdict -- and the reason it could not be
+        // asked survives into the label unchanged.
+        assert_eq!(InstallVersion::Silent.is_behind(Some(&latest)), None);
+        assert_eq!(InstallVersion::TimedOut.is_behind(Some(&latest)), None);
+        assert_eq!(
+            install_label(&InstallVersion::TimedOut, Some(&latest)),
+            "hung; killed after timing out"
+        );
+    }
+
+    #[test]
+    fn compares_prereleases_by_semver_precedence() {
+        let latest = Version::parse("27.1.0").unwrap();
+
+        // A release candidate for the latest version is still behind it, which
+        // is what semver precedence says and what the user needs to hear.
+        assert_eq!(known("27.1.0-rc.1").is_behind(Some(&latest)), Some(true));
+    }
+
     #[test]
     fn a_probe_outcome_labels_itself_distinctly() {
         // The user has to be able to tell a hung executable from an unreadable
@@ -912,6 +1116,7 @@ mod tests {
             InstallVersion::Silent.label()
         );
     }
+
     #[test]
     fn agreement_needs_every_executable_to_have_answered() {
         assert_eq!(
