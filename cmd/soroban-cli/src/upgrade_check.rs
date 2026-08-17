@@ -112,7 +112,9 @@ pub async fn upgrade_check(quiet: bool) {
 
     tracing::debug!("start upgrade check");
 
-    if let Ok((true, current_version, latest_version)) = has_available_upgrade(true).await {
+    if let Ok((true, current_version, latest_version)) =
+        has_available_upgrade(CachePolicy::Reuse).await
+    {
         let printer = Print::new(quiet);
         printer.warnln(upgrade_message(&current_version, &latest_version));
     }
@@ -120,8 +122,22 @@ pub async fn upgrade_check(quiet: bool) {
     tracing::debug!("finished upgrade check");
 }
 
+/// How a caller wants the shared version cache treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Reuse a result younger than `MINIMUM_CHECK_INTERVAL`, fetch when it is
+    /// older, and record the result. What an ordinary background check wants.
+    Reuse,
+    /// Always fetch, and never write. For a caller that is *reporting on* the
+    /// cache rather than relying on it: writing would make this run the file's
+    /// last writer and erase the very entry being reported, and stamping
+    /// `latest_check_time` would silently pace the next real check off a
+    /// diagnostic that the user ran to look, not to check.
+    ReadOnly,
+}
+
 pub async fn has_available_upgrade(
-    cache: bool,
+    policy: CachePolicy,
 ) -> Result<(bool, Version, Version), Box<dyn Error>> {
     let current_version = crate::commands::version::pkg();
 
@@ -131,8 +147,9 @@ pub async fn has_available_upgrade(
     });
 
     let now = chrono::Utc::now();
+    let read_only = policy == CachePolicy::ReadOnly;
     // Skip fetch from crates.io if we've checked recently
-    if !cache || now - MINIMUM_CHECK_INTERVAL >= stats.latest_check_time {
+    if read_only || now - MINIMUM_CHECK_INTERVAL >= stats.latest_check_time {
         match fetch_latest_crate_info().await {
             Ok(c) => {
                 stats = UpgradeCheck {
@@ -154,8 +171,10 @@ pub async fn has_available_upgrade(
             }
         }
 
-        if let Err(e) = stats.save() {
-            tracing::debug!("Failed to save upgrade check data: {e}");
+        if !read_only {
+            if let Err(e) = stats.save() {
+                tracing::debug!("Failed to save upgrade check data: {e}");
+            }
         }
     }
 

@@ -145,10 +145,10 @@ fn sibling_binary(name: &str) -> String {
 /// Seed the shared version cache with a given writer, and return the data home
 /// that holds it.
 ///
-/// `latest_check_time` is irrelevant to what is asserted here: `doctor` calls
-/// `has_available_upgrade` with caching off, so it always attempts a refresh.
-/// The seeded writer is still what gets reported, because `doctor` reads it
-/// before that refresh can overwrite it.
+/// `latest_check_time` is irrelevant to what is asserted here: `doctor` runs its
+/// check with `CachePolicy::ReadOnly`, so it always attempts a refresh and never
+/// writes the result. The seeded writer is what gets reported however many times
+/// `doctor` runs -- see `reports_the_same_cache_writer_on_a_second_run`.
 fn seed_cache_writer(sandbox: &TestEnv, writer: serde_json::Value) -> PathBuf {
     let data_home = empty_dir(sandbox, "cache-data-home");
 
@@ -476,7 +476,7 @@ fn warns_when_the_other_binary_name_wrote_the_cache_at_another_version() {
 }
 
 #[test]
-fn reports_an_unknown_cache_writer_without_claiming_a_mismatch() {
+fn reports_a_cache_that_predates_the_writer_field_without_claiming_a_mismatch() {
     let sandbox = TestEnv::default();
     let bin_dir = empty_dir(&sandbox, "bin");
     // A cache written before the writer was recorded.
@@ -486,9 +486,72 @@ fn reports_an_unknown_cache_writer_without_claiming_a_mismatch() {
         .assert()
         .success()
         .stderr(contains(
-            "Version cache was last checked by an unknown Stellar CLI",
+            "Version cache predates the record of which Stellar CLI writes it",
         ))
         .stderr(contains("a different Stellar CLI").not());
+}
+/// The ordinary state of a machine that has never run the CLI before, and the
+/// state a user reaches by deleting the data home. Reporting it as a writer --
+/// even an unknown one -- would name a Stellar CLI that never ran, which is the
+/// wrong thing to tell someone who came to `doctor` suspecting a rogue install.
+#[test]
+fn does_not_invent_a_cache_writer_when_there_is_no_cache() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "bin");
+    let data_home = empty_dir(&sandbox, "empty-data-home");
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains("No version cache yet"))
+        .stderr(contains("last checked by").not());
+}
+/// A present-but-unreadable cache is the one state here that is a fault: the
+/// next check cannot be paced off it and no warning built from it can be
+/// trusted. It must not read like the benign cases above.
+#[test]
+fn warns_when_the_cache_cannot_be_read() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "bin");
+    let data_home = empty_dir(&sandbox, "corrupt-data-home");
+    fs::write(data_home.join("upgrade_check.json"), "{ truncated").unwrap();
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(contains("Version cache exists but could not be read"))
+        .stderr(contains("No version cache yet").not())
+        .stderr(contains("predates the record").not());
+}
+/// `doctor` reports which install last wrote the version cache, so it must not
+/// become that install itself. Its own check runs read-only for exactly this
+/// reason: otherwise the first run overwrites the entry it just reported, and a
+/// user who runs `doctor` again -- to show a colleague, or to paste into an issue
+/// -- finds the mismatch gone and cannot reproduce what they saw.
+#[test]
+fn reports_the_same_cache_writer_on_a_second_run() {
+    let sandbox = TestEnv::default();
+    let bin_dir = empty_dir(&sandbox, "bin");
+    let data_home = seed_cache_writer(
+        &sandbox,
+        serde_json::json!({ "version": "22.8.0", "executable": "/opt/elsewhere/bin/soroban" }),
+    );
+
+    let expected = contains(
+        "Version cache was last checked by a different Stellar CLI: \
+         22.8.0 (/opt/elsewhere/bin/soroban)",
+    );
+
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(expected.clone());
+
+    // The same report, not a report of the run that just happened.
+    doctor(&sandbox, &bin_dir, &data_home)
+        .assert()
+        .success()
+        .stderr(expected);
 }
 
 /// Tokio's `output()` pipes stdout and stderr but leaves stdin untouched, so a

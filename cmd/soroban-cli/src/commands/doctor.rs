@@ -11,11 +11,13 @@ use crate::{
         self, data,
         locator::{self, KeyType},
         network::{Network, DEFAULTS as DEFAULT_NETWORKS},
-        upgrade_check::{CheckWriter, UpgradeCheck},
+        upgrade_check::{LastWriter, UpgradeCheck},
     },
     print::Print,
     rpc,
-    upgrade_check::{check_performed_by, has_available_upgrade, running_binary, upgrade_message},
+    upgrade_check::{
+        check_performed_by, has_available_upgrade, running_binary, upgrade_message, CachePolicy,
+    },
     utils::url::redact_url,
 };
 
@@ -48,16 +50,18 @@ impl Cmd {
     pub async fn run(&self, _global_args: &global::Args) -> Result<(), Error> {
         let print = Print::new(false);
 
-        // Read this before `check_version`, which refreshes the cache and would
-        // otherwise record this very run as the writer -- hiding the mismatch
-        // the report exists to reveal. `cli::runs_its_own_upgrade_check` keeps
-        // the background check from being spawned alongside this command, so
-        // that refresh is the only writer this read has to stay ahead of.
-        let previous_cache_writer = version_cache_writer();
+        // `doctor` reports on the cache, so it must not become the cache's last
+        // writer: its own check runs `ReadOnly` and leaves the file alone. The
+        // read is still taken first, which keeps the report the same whichever
+        // order these run in, and `cli::runs_its_own_upgrade_check` keeps the
+        // background check from being spawned alongside this command -- that one
+        // does write. Between the two, running `doctor` twice reports the same
+        // writer both times instead of erasing it on the first run.
+        let previous_cache_writer = UpgradeCheck::last_writer();
 
         check_version(&print).await?;
         check_installs(&print).await;
-        show_version_cache_writer(&print, previous_cache_writer.as_ref());
+        show_version_cache_writer(&print, &previous_cache_writer);
         check_rust_version(&print);
         check_wasm_target(&print);
         check_optional_features(&print);
@@ -157,7 +161,7 @@ async fn inspect_networks(print: &Print, config_locator: &locator::Args) -> Resu
 
 async fn check_version(print: &Print) -> Result<(), Error> {
     if let Ok((upgrade_available, current_version, latest_version)) =
-        has_available_upgrade(false).await
+        has_available_upgrade(CachePolicy::ReadOnly).await
     {
         if upgrade_available {
             print.warnln(upgrade_message(&current_version, &latest_version));
@@ -169,12 +173,6 @@ async fn check_version(print: &Print) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-/// Which CLI last checked for a new release and wrote the shared version cache,
-/// if it recorded itself.
-fn version_cache_writer() -> Option<CheckWriter> {
-    UpgradeCheck::load().ok()?.last_checked_by
 }
 
 /// Report which CLI last checked for a new release and wrote the shared version
@@ -207,12 +205,40 @@ fn version_cache_writer() -> Option<CheckWriter> {
 /// `cargo install soroban-cli` sits in the same `~/.cargo/bin` as the `stellar`
 /// that replaced it, at a version years apart; siblings are the shape of the
 /// confusion in #2464, not proof of a shared origin.
-fn show_version_cache_writer(print: &Print, writer: Option<&CheckWriter>) {
-    let Some(writer) = writer else {
-        // Either no cache yet or one written before the CLI recorded this, so
-        // there is nothing to report rather than something being wrong.
-        print.infoln("Version cache was last checked by an unknown Stellar CLI".to_string());
-        return;
+fn show_version_cache_writer(print: &Print, last_writer: &LastWriter) {
+    let writer = match last_writer {
+        // Ordinary, and true of every first run on a machine. Saying an unknown
+        // CLI wrote the file would invent a third party for a user who is
+        // already suspicious of one.
+        LastWriter::NoCache => {
+            print.checkln(
+                "No version cache yet; nothing has checked for a new release on this machine"
+                    .to_string(),
+            );
+            return;
+        }
+        // A real fault, and the one state here that is worth acting on: the file
+        // is present and cannot be read, so the next check cannot be paced and
+        // no warning built from it can be trusted.
+        LastWriter::Unreadable => {
+            print.warnln(
+                "Version cache exists but could not be read; delete it to let the next check \
+                 rewrite it"
+                    .to_string(),
+            );
+            return;
+        }
+        // The cache predates the field. Nothing is wrong; there is simply
+        // nothing recorded to compare against.
+        LastWriter::Unrecorded => {
+            print.infoln(
+                "Version cache predates the record of which Stellar CLI writes it, so its writer \
+                 is unknown"
+                    .to_string(),
+            );
+            return;
+        }
+        LastWriter::Recorded(writer) => writer,
     };
 
     let this_cli = check_performed_by();

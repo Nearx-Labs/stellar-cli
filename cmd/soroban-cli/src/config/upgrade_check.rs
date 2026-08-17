@@ -88,14 +88,68 @@ impl Default for UpgradeCheck {
     }
 }
 
+/// What the shared version cache says about the CLI that last wrote it.
+///
+/// Four states, kept apart because they call for four different things to be
+/// said. Collapsing them loses the distinction between "nothing has checked on
+/// this machine yet" -- which is ordinary, and true of every first run -- and
+/// "the file is there but unreadable", which is a real fault worth naming. A
+/// report that folds them together either invents a writer that never existed
+/// or reassures the user about a corrupt file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastWriter {
+    /// No cache file on this machine: nothing has checked for a release yet.
+    NoCache,
+    /// The cache file exists but could not be read or parsed.
+    Unreadable,
+    /// The cache loaded, but it predates the field that records its writer.
+    Unrecorded,
+    /// The cache records the CLI that last wrote it.
+    Recorded(CheckWriter),
+}
+
 impl UpgradeCheck {
+    /// Where the shared cache lives. One spelling, so a caller that needs to
+    /// tell "no file" apart from "unreadable file" asks about the same path
+    /// `load` and `save` use.
+    fn file_path() -> Result<std::path::PathBuf, locator::Error> {
+        Ok(project_dir()
+            .map_err(|_| locator::Error::ProjectDirsError())?
+            .data_dir()
+            .join(FILE_NAME))
+    }
+
+    /// Which CLI last checked for a new release and wrote this file.
+    ///
+    /// Distinct from `load().last_checked_by`: `load` maps a missing file onto
+    /// the default value, which is indistinguishable from a file that loaded
+    /// without a recorded writer, and maps an unreadable file onto an error a
+    /// caller is likely to discard. Each of those is a different thing to tell
+    /// the user, so each gets its own variant here.
+    pub fn last_writer() -> LastWriter {
+        let Ok(path) = Self::file_path() else {
+            return LastWriter::Unreadable;
+        };
+
+        if !path.exists() {
+            return LastWriter::NoCache;
+        }
+
+        match Self::load() {
+            Ok(check) => check
+                .last_checked_by
+                .map_or(LastWriter::Unrecorded, LastWriter::Recorded),
+            Err(e) => {
+                tracing::debug!("Failed to read the version cache writer: {e}");
+                LastWriter::Unreadable
+            }
+        }
+    }
+
     /// Loads the state of the upgrade check from the global configuration directory.
     /// If the file doesn't exist, returns a default instance of `UpgradeCheck`.
     pub fn load() -> Result<Self, locator::Error> {
-        let path = project_dir()
-            .map_err(|_| locator::Error::ProjectDirsError())?
-            .data_dir()
-            .join(FILE_NAME);
+        let path = Self::file_path()?;
 
         if !path.exists() {
             return Ok(Self::default());
@@ -109,11 +163,7 @@ impl UpgradeCheck {
 
     /// Saves the state of the upgrade check to the `upgrade_check.json` file in the global data directory.
     pub fn save(&self) -> Result<(), locator::Error> {
-        let path = project_dir()
-            .map_err(|_| locator::Error::ProjectDirsError())?
-            .data_dir()
-            .join(FILE_NAME);
-
+        let path = Self::file_path()?;
         let path = locator::ensure_directory(path)?;
         let data = serde_json::to_string(self).map_err(|_| locator::Error::ConfigSerialization)?;
         locator::write_hardened_file(&path, data.as_bytes())
