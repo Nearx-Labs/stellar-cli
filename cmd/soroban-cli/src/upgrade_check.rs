@@ -7,7 +7,23 @@ use std::error::Error;
 use std::io::IsTerminal;
 use std::time::Duration;
 
-// One day.
+// One day. This is also the width of the window in which the reported latest
+// version can be out of date, which is worth stating plainly because it is the
+// literal symptom of #2464: "upgrade check warning shows wrong latest version".
+//
+// A cache written yesterday reports yesterday's latest release. If a release
+// lands three hours from now, warnings keep naming the previous one until this
+// interval elapses. What #2464 reported was the unbounded form of that -- a
+// background check dropped before it could write, so the cache went stale and
+// stayed stale indefinitely while every run re-fetched and reported the old
+// value anyway. The grace period in `cli::finish_upgrade_check` closes that,
+// which narrows the window from "forever" to "up to a day".
+//
+// The remaining day is deliberate, not an oversight: the alternative is a
+// network round trip on every command. But it does mean a report of a stale
+// latest version can be accurate and expected rather than a bug, and anyone
+// triaging one should check the age of `latest_check_time` before treating it
+// as a regression.
 const MINIMUM_CHECK_INTERVAL: Duration = Duration::from_hours(24);
 // The shared HTTP client only bounds how long connecting may take, so a server
 // that accepts the connection and then stalls would leave the request hanging
