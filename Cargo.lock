@@ -5700,6 +5700,7 @@ dependencies = [
  "hex",
  "home",
  "httpmock",
+ "libc",
  "markdown",
  "predicates",
  "reqwest",
